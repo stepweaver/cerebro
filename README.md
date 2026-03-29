@@ -1,26 +1,22 @@
 # Cerebro
 
-**Cerebro** is a minimal **Notion → Supabase mirror** with a **hosted MCP** read API. Notion is the human-facing source of truth; Cerebro stores a **latest snapshot** of each page for **lexical search** and tool-based retrieval.
+**Cerebro** is a small **personal memory service**: **Slack** is the quick capture inbox, **Notion** is an optional structured source, and both stream **raw** rows into Supabase. **MCP** is the read-only retrieval layer. **AI enrichment** can be added later; capture does **not** depend on any model.
 
-This version is intentionally small:
+This build stays intentionally small:
 
 - **One** Postgres table: `thoughts`
-- **One** Edge Function for capture: `cerebro-ingest-notion` (Notion webhooks → upsert)
-- **One** Edge Function for retrieval: `cerebro-mcp` (read-only MCP over HTTP)
-- **Lexical** search first (Postgres full-text search); **no** embeddings or model calls at ingest
-- **No** AI enrichment pipeline yet (optional later)
+- **Two** capture Edge Functions: `cerebro-ingest-slack`, `cerebro-ingest-notion`
+- **One** read Edge Function: `cerebro-mcp` (lexical search only; no embeddings at ingest)
 
-Raw capture does **not** depend on any LLM. Optional enrichment can be added on top later.
+Mental model: *Cerebro is an owned memory store with multiple raw capture sources. Slack is the quick inbox. Notion is optional structured input. MCP is the retrieval layer.*
 
 ---
 
 ## Architecture
 
-- **Notion**: capture and editing UI; sends webhook **signals** only (not full page bodies).
-- **`cerebro-ingest-notion`**: verifies `X-Notion-Signature`, fetches the page again from the Notion API (`Notion-Version: 2026-03-11`), prefers **page-as-markdown**, falls back to **block tree → plain text**, upserts into `thoughts`.
-- **`cerebro-mcp`**: **read-only** MCP server (`name: cerebro`) using the **Streamable HTTP** transport; queries Supabase with the service role.
-
-Mental model: **Cerebro is a single MCP server backed by Supabase; Notion is the capture UI.**
+- **Slack**: humans post in a dedicated channel; Events API delivers `message` payloads; **one message = one thought**, keyed by `slack:event:{event_id}`.
+- **Notion**: webhooks are signals only; ingest refetches the page (`Notion-Version: 2026-03-11`), prefers markdown, falls back to blocks; keyed by `notion:page:{page_id}`.
+- **`cerebro-mcp`**: read-only tools (`search_thoughts`, `list_thoughts`, `thought_stats`, `get_thought`) using the service role.
 
 ---
 
@@ -28,85 +24,91 @@ Mental model: **Cerebro is a single MCP server backed by Supabase; Notion is the
 
 ### 1. Create a Supabase project
 
-Create a project in the [Supabase dashboard](https://supabase.com/dashboard) and note **Project URL** and **service_role** key (Settings → API).
+Note **Project URL**, **project ref**, and **service_role** key (Settings → API).
 
-### 2. Link this repo to Supabase
-
-Install the [Supabase CLI](https://supabase.com/docs/guides/cli), then from the repo root:
+### 2. Link this repo
 
 ```bash
 supabase login
 supabase link --project-ref YOUR_PROJECT_REF
 ```
 
-### 3. Run the migration
+### 3. Run migrations
 
 ```bash
 supabase db push
 ```
 
-(Or apply [`supabase/migrations/001_cerebro.sql`](supabase/migrations/001_cerebro.sql) in the SQL editor.)
+### 4. Slack app (inbox)
 
-### 4. Create a Notion internal integration
+1. Create a [Slack app](https://api.slack.com/apps) for your workspace.
+2. **Event Subscriptions** → On → **Request URL**:
+   `https://YOUR_PROJECT_REF.supabase.co/functions/v1/cerebro-ingest-slack`
+3. Subscribe to bot events: **`message.channels`** and **`message.groups`** (private channels need `message.groups`).
+4. **Install to workspace**, then **invite the app/bot** to your dedicated capture channel.
+5. Copy the channel ID (e.g. `C...`) for `SLACK_CAPTURE_CHANNEL_ID`.
 
-1. [My integrations](https://www.notion.so/my-integrations) → **New integration**.
-2. Under **Capabilities**, enable **Read content** (required for page body and markdown).
+**Slack gotchas**
 
-### 5. Webhook subscription
+- The app must be **in the channel** to receive messages.
+- Private channels need **`message.groups`** and an install that includes that scope.
+- Slack **retries** deliveries; duplicate `event_id` hits the unique `source_key` and returns **200** (idempotent).
 
-1. Open the integration → **Webhooks** → **Create a subscription**.
-2. **Webhook URL**:
+### 5. Notion (optional mirror)
 
+1. [My integrations](https://www.notion.so/my-integrations) → internal integration with **Read content**.
+2. **Webhooks** → URL:
    `https://YOUR_PROJECT_REF.supabase.co/functions/v1/cerebro-ingest-notion`
+3. Subscribe to page events you care about (e.g. `page.created`, `page.content_updated`, `page.properties_updated`, `page.deleted`, `page.undeleted`).
+4. Copy the webhook **verification token** for `NOTION_WEBHOOK_VERIFICATION_TOKEN`.
+5. Share **pages or the original data source** with the integration (avoid linked-only views for API sync).
 
-3. Subscribe at least to: `page.created`, `page.content_updated`, `page.properties_updated`, `page.deleted`, `page.undeleted`.
-4. Complete Notion’s verification flow; copy the **webhook verification token** (used as the HMAC secret for `X-Notion-Signature`).
+**Notion gotchas**
 
-### 6. Share content with the integration
+- Without sharing, reads fail.
+- Webhooks are notifications only; ingest **refetches** the page.
+- This mirror is **latest state only**, not revision history.
 
-- Share the **pages** or **original data source** you want mirrored (**not** a linked database / linked data source view — the API does not treat those as first-class sync targets).
-- If the integration is not invited to the page or data source, API reads will **404** / fail.
-
-### 7. Set Edge Function secrets
+### 6. Secrets
 
 ```bash
 supabase secrets set NOTION_API_KEY=secret_...
 supabase secrets set NOTION_WEBHOOK_VERIFICATION_TOKEN=secret_...
+supabase secrets set SLACK_SIGNING_SECRET=...
+supabase secrets set SLACK_CAPTURE_CHANNEL_ID=C...
 supabase secrets set MCP_ACCESS_KEY=your-long-random-string
 ```
 
-Optional (restrict mirroring to a subtree):
+Optional:
 
 ```bash
-supabase secrets set NOTION_ALLOWED_PARENT_ID=uuid-of-parent-page-or-database
+supabase secrets set NOTION_ALLOWED_PARENT_ID=uuid
 ```
 
-`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are usually **injected automatically** for Edge Functions in hosted Supabase. If yours are not, set them explicitly:
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are usually auto-injected on hosted Supabase. If not:
 
 ```bash
 supabase secrets set SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
 supabase secrets set SUPABASE_SERVICE_ROLE_KEY=eyJ...
 ```
 
-### 8. Deploy Edge Functions
-
-JWT verification is disabled so Notion and MCP clients do not need a Supabase JWT:
+### 7. Deploy Edge Functions
 
 ```bash
 supabase functions deploy cerebro-ingest-notion --no-verify-jwt
+supabase functions deploy cerebro-ingest-slack --no-verify-jwt
 supabase functions deploy cerebro-mcp --no-verify-jwt
 ```
 
-### 9. Connect Cursor to `cerebro-mcp`
+### 8. Connect Cursor to `cerebro-mcp`
 
-**MCP URL pattern** (query key):
+**URL with query key:**
 
 `https://YOUR_PROJECT_REF.supabase.co/functions/v1/cerebro-mcp?key=YOUR_MCP_ACCESS_KEY`
 
-Or send header **`x-brain-key: YOUR_MCP_ACCESS_KEY`** (same value as `MCP_ACCESS_KEY`).
+Or header **`x-brain-key`** (same value as `MCP_ACCESS_KEY`).
 
-- If Cursor supports **remote MCP URLs** directly, use the URL above.
-- If Cursor only supports a **local stdio** MCP, use a bridge such as **`mcp-remote`**:
+If you need a local bridge, use **`mcp-remote`**:
 
 ```json
 {
@@ -133,40 +135,22 @@ Or send header **`x-brain-key: YOUR_MCP_ACCESS_KEY`** (same value as `MCP_ACCESS
 
 | Tool | Purpose |
 |------|---------|
-| `search_thoughts` | Lexical FTS (+ ILIKE fallback) over `thoughts` |
-| `list_thoughts` | Recent rows by `updated_at` |
-| `thought_stats` | Counts, date ranges, per-`source` totals |
-| `get_thought` | One row by Cerebro `id` or Notion page id |
+| `search_thoughts` | Lexical FTS + optional `source` filter |
+| `list_thoughts` | Recent rows; optional `source`, `days` |
+| `thought_stats` | Totals, by source, enrichment pending count |
+| `get_thought` | One row by `id` or `sourceKey` |
 
-There is **no** `capture_thought`, `update_thought`, `delete_thought`, semantic search, or write-back to Notion in this build.
-
----
-
-## Notion behavior notes
-
-- Webhooks are **notifications**; this stack **always refetches** the page via the API after an event.
-- **Page content** and **page properties** updates may arrive as **different** event types; both paths upsert the same row.
-- Cerebro stores the **current** page snapshot only — **not** full revision history.
-- This version is **lexical search only**; vector / enrichment can be layered on later.
-
----
-
-## Common Notion gotchas
-
-- **Sharing**: If the integration is not shared on the page or underlying data source, reads fail.
-- **Linked views**: Linked databases / linked data sources are poor fit for API-based sync; share the **original** data source.
-- **Latency**: Some events (e.g. `page.content_updated`) can be **aggregated** and arrive after a short delay.
-- **Signature**: Store the **verification token** as `NOTION_WEBHOOK_VERIFICATION_TOKEN`; each payload is verified with **HMAC-SHA256** over the **raw** body (`X-Notion-Signature: sha256=...`).
+Not implemented: capture/update/delete tools, semantic search, write-back to Slack or Notion.
 
 ---
 
 ## How to test
 
-1. **Create or edit** a Notion page that is shared with the integration (add some title and body text).
-2. Confirm the **webhook** fires (Notion integration webhook delivery UI or Supabase Edge Function logs).
-3. In Supabase **Table Editor** or SQL: confirm a row in **`thoughts`** with the expected `source_page_id` and `content`.
-4. Connect Cursor (or `mcp-remote`) to **`cerebro-mcp`** using `MCP_ACCESS_KEY`.
-5. In the MCP client, run **`list_thoughts`**, **`search_thoughts`**, **`thought_stats`**, and optionally **`get_thought`** with a known page id.
+1. **Slack**: Complete URL verification in Event Subscriptions; post a message in the capture channel.
+2. **DB**: Row in `thoughts` with `source = slack`, `source_key = slack:event:...`, `content` = message text.
+3. **MCP**: `list_thoughts` with `source: "slack"`; `search_thoughts` on a phrase from the message.
+4. **Notion**: Edit a shared page; confirm a `source = notion` row (or update) still works.
+5. **MCP**: `thought_stats` shows counts for both sources.
 
 ---
 
@@ -175,8 +159,10 @@ There is **no** `capture_thought`, `update_thought`, `delete_thought`, semantic 
 ```text
 supabase/
   migrations/
-    001_cerebro.sql          -- thoughts + FTS + RLS + search/stats RPCs
+    001_cerebro.sql
+    002_hybrid_slack.sql
   functions/
-    cerebro-ingest-notion/   -- Notion webhook → mirror
-    cerebro-mcp/             -- Hosted MCP (read-only)
+    cerebro-ingest-notion/
+    cerebro-ingest-slack/
+    cerebro-mcp/
 ```

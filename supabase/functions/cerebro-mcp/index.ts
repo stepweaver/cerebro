@@ -30,13 +30,6 @@ function excerpt(text: string, max = 200): string {
   return t.slice(0, max) + "…";
 }
 
-/** Normalize Notion page id to hyphenated UUID when possible. */
-function formatNotionPageId(id: string): string {
-  const s = id.replace(/-/g, "");
-  if (s.length !== 32) return id;
-  return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`;
-}
-
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
@@ -48,18 +41,20 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
     "search_thoughts",
     {
       description:
-        "Lexical full-text search over mirrored Notion pages (title + content). Returns ranked excerpts.",
+        "Lexical full-text search (title + content). Optional filter by source (e.g. slack, notion).",
       inputSchema: {
         query: z.string().min(1).describe("Search query"),
         limit: z.number().int().min(1).max(50).optional().default(10),
+        source: z.string().min(1).optional().describe("Filter by source"),
         includeDeleted: z.boolean().optional().default(false),
       },
     },
-    async ({ query, limit, includeDeleted }) => {
+    async ({ query, limit, source, includeDeleted }) => {
       const { data, error } = await supabase.rpc("lexical_search_thoughts", {
         search_query: query,
         result_limit: limit,
         include_deleted: includeDeleted,
+        filter_source: source ?? null,
       });
       if (error) {
         return textResult(`search error: ${error.message}`);
@@ -68,24 +63,27 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
         title: string | null;
         updated_at: string;
         source: string;
-        source_page_id: string;
+        source_key: string;
+        source_page_id: string | null;
         source_url: string | null;
         content: string;
-        rank: number;
       }>;
       if (rows.length === 0) {
         return textResult("No matching thoughts.");
       }
       const lines = rows.map((r, i) => {
-        const title = r.title?.trim() || "(untitled)";
-        const url = r.source_url ?? "(no url)";
+        const title = r.title?.trim() || "(no title)";
+        const idLine =
+          r.source === "notion"
+            ? `Notion page id: ${r.source_page_id ?? "n/a"}`
+            : `Source key: ${r.source_key}`;
         return [
           `--- ${i + 1} ---`,
-          `Title: ${title}`,
-          `Updated: ${r.updated_at}`,
           `Source: ${r.source}`,
-          `Notion page id: ${r.source_page_id}`,
-          `URL: ${url}`,
+          `Updated: ${r.updated_at}`,
+          `Title: ${title}`,
+          idLine,
+          `URL: ${r.source_url ?? "n/a"}`,
           `Excerpt: ${excerpt(r.content)}`,
           "",
         ].join("\n");
@@ -97,22 +95,24 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
   server.registerTool(
     "list_thoughts",
     {
-      description: "List recent mirrored thoughts, newest first.",
+      description: "Recent thoughts (Slack + Notion), newest first.",
       inputSchema: {
         limit: z.number().int().min(1).max(100).optional().default(10),
         days: z.number().int().min(1).max(3650).optional(),
+        source: z.string().min(1).optional(),
         includeDeleted: z.boolean().optional().default(false),
       },
     },
-    async ({ limit, days, includeDeleted }) => {
+    async ({ limit, days, source, includeDeleted }) => {
       let q = supabase
         .from("thoughts")
         .select(
-          "id, title, source, source_page_id, source_url, updated_at, is_deleted, content",
+          "id, title, source, source_key, source_page_id, source_url, updated_at, is_deleted, content",
         )
         .order("updated_at", { ascending: false })
         .limit(limit);
       if (!includeDeleted) q = q.eq("is_deleted", false);
+      if (source) q = q.eq("source", source);
       if (days != null) {
         const since = new Date();
         since.setUTCDate(since.getUTCDate() - days);
@@ -123,14 +123,18 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
       const rows = data ?? [];
       if (rows.length === 0) return textResult("No thoughts found.");
       const lines = rows.map((r: Record<string, unknown>, i: number) => {
-        const title = (r.title as string | null)?.trim() || "(untitled)";
+        const title = (r.title as string | null)?.trim() || "(no title)";
+        const idPart =
+          r.source === "notion"
+            ? `Notion page id: ${r.source_page_id}`
+            : `Source key: ${r.source_key}`;
         return [
           `--- ${i + 1} ---`,
-          `Title: ${title}`,
-          `Updated: ${r.updated_at}`,
           `Source: ${r.source}`,
-          `Notion page id: ${r.source_page_id}`,
-          `URL: ${r.source_url ?? "(no url)"}`,
+          `Updated: ${r.updated_at}`,
+          `Title: ${title}`,
+          idPart,
+          `URL: ${r.source_url ?? "n/a"}`,
           `Deleted: ${r.is_deleted}`,
           `Preview: ${excerpt(String(r.content ?? ""))}`,
           "",
@@ -143,7 +147,7 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
   server.registerTool(
     "thought_stats",
     {
-      description: "Aggregate counts and date ranges for mirrored thoughts.",
+      description: "Aggregate counts; includes breakdown by source.",
     },
     async () => {
       const { data, error } = await supabase.rpc("cerebro_thought_stats");
@@ -157,8 +161,6 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
         `Earliest created_at: ${s.earliest_created_at ?? "n/a"}`,
         `Latest updated_at: ${s.latest_updated_at ?? "n/a"}`,
         `By source: ${JSON.stringify(s.by_source ?? {})}`,
-        `With title: ${s.with_title}`,
-        `Without title: ${s.without_title}`,
         `Awaiting enrichment (enriched_at is null): ${s.awaiting_enrichment}`,
       ];
       return textResult(lines.join("\n"));
@@ -168,21 +170,21 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
   server.registerTool(
     "get_thought",
     {
-      description: "Fetch one thought by Cerebro id or Notion page id.",
+      description: "Fetch one thought by row id or source_key.",
       inputSchema: {
-        pageId: z.string().optional().describe("Notion page id"),
         id: z.string().uuid().optional().describe("Cerebro row UUID"),
+        sourceKey: z.string().min(1).optional().describe("Idempotency key e.g. slack:event:… or notion:page:…"),
       },
     },
-    async (args: { pageId?: string; id?: string }) => {
-      const hasPage = args.pageId != null && String(args.pageId).trim().length > 0;
+    async (args: { id?: string; sourceKey?: string }) => {
       const hasId = args.id != null && String(args.id).trim().length > 0;
-      if (hasPage === hasId) {
-        return textResult("Provide exactly one of pageId or id");
+      const hasKey = args.sourceKey != null && String(args.sourceKey).trim().length > 0;
+      if (hasId === hasKey) {
+        return textResult("Provide exactly one of id or sourceKey");
       }
       let q = supabase.from("thoughts").select("*");
       if (hasId) q = q.eq("id", args.id!);
-      else q = q.eq("source_page_id", formatNotionPageId(args.pageId!.trim()));
+      else q = q.eq("source_key", args.sourceKey!.trim());
       const { data, error } = await q.maybeSingle();
       if (error) return textResult(`get error: ${error.message}`);
       if (!data) return textResult("Not found.");
@@ -191,7 +193,8 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
       const lines = [
         `id: ${r.id}`,
         `source: ${r.source}`,
-        `source_page_id: ${r.source_page_id}`,
+        `source_key: ${r.source_key}`,
+        `source_page_id: ${r.source_page_id ?? "null"}`,
         `source_url: ${r.source_url ?? "n/a"}`,
         `title: ${r.title ?? "(none)"}`,
         `updated_at: ${r.updated_at}`,
@@ -200,8 +203,10 @@ function createMcpServer(supabase: SupabaseClient): McpServer {
         `enriched_at: ${r.enriched_at ?? "null"}`,
         "",
         "Metadata summary:",
+        `  raw source tag: ${meta?.source ?? "n/a"}`,
         `  notion_event_type: ${meta?.notion_event_type ?? "n/a"}`,
-        `  notion_last_edited_time: ${meta?.notion_last_edited_time ?? "n/a"}`,
+        `  slack_event_id: ${meta?.slack_event_id ?? "n/a"}`,
+        `  slack_channel: ${meta?.slack_channel ?? "n/a"}`,
         "",
         "Content:",
         String(r.content ?? ""),

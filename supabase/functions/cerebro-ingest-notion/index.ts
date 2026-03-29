@@ -417,6 +417,7 @@ Deno.serve(async (req) => {
       await supabase
         .from("thoughts")
         .update({ is_deleted: true })
+        .eq("source", "notion")
         .eq("source_page_id", pageId);
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
@@ -445,7 +446,7 @@ Deno.serve(async (req) => {
     }
 
     if (eventType === "page.undeleted") {
-      await supabase.from("thoughts").update({ is_deleted: false }).eq(
+      await supabase.from("thoughts").update({ is_deleted: false }).eq("source", "notion").eq(
         "source_page_id",
         pageId,
       );
@@ -497,7 +498,7 @@ Deno.serve(async (req) => {
     };
 
     const { error } = await supabase.from("thoughts").upsert(row, {
-      onConflict: "source_page_id",
+      onConflict: "source_key",
     });
 
     if (error) {
