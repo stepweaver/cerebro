@@ -1,15 +1,11 @@
--- Cerebro: single-table mirror + lexical full-text search (no vectors in v1)
+﻿-- Cerebro (Slack-only): raw capture + lexical full-text search (no vectors)
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- ---------------------------------------------------------------------------
--- thoughts: one row per mirrored Notion page (latest snapshot only)
--- ---------------------------------------------------------------------------
 CREATE TABLE public.thoughts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  source text NOT NULL DEFAULT 'notion',
+  source text NOT NULL DEFAULT 'slack',
   source_key text NOT NULL UNIQUE,
-  source_page_id text NOT NULL UNIQUE,
   source_url text,
   title text,
   content text NOT NULL DEFAULT '',
@@ -26,14 +22,12 @@ CREATE TABLE public.thoughts (
   ) STORED
 );
 
+CREATE INDEX thoughts_source_idx ON public.thoughts (source);
 CREATE INDEX thoughts_content_tsv_gin ON public.thoughts USING gin (content_tsv);
 CREATE INDEX thoughts_raw_metadata_gin ON public.thoughts USING gin (raw_metadata);
 CREATE INDEX thoughts_updated_at_desc_idx ON public.thoughts (updated_at DESC);
 CREATE INDEX thoughts_is_deleted_idx ON public.thoughts (is_deleted);
 
--- ---------------------------------------------------------------------------
--- updated_at trigger
--- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.set_updated_at()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -49,9 +43,6 @@ CREATE TRIGGER thoughts_set_updated_at
   FOR EACH ROW
   EXECUTE FUNCTION public.set_updated_at();
 
--- ---------------------------------------------------------------------------
--- Row level security (service_role policy only)
--- ---------------------------------------------------------------------------
 ALTER TABLE public.thoughts ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "service_role_full_access_thoughts"
@@ -61,9 +52,6 @@ CREATE POLICY "service_role_full_access_thoughts"
   USING (true)
   WITH CHECK (true);
 
--- ---------------------------------------------------------------------------
--- Lexical search (FTS + optional ILIKE fallback) for MCP tool
--- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.lexical_search_thoughts(
   search_query text,
   result_limit int DEFAULT 10,
@@ -73,7 +61,6 @@ RETURNS TABLE (
   id uuid,
   source text,
   source_key text,
-  source_page_id text,
   source_url text,
   title text,
   content text,
@@ -107,7 +94,6 @@ BEGIN
       t.id,
       t.source,
       t.source_key,
-      t.source_page_id,
       t.source_url,
       t.title,
       t.content,
@@ -133,7 +119,6 @@ BEGIN
       t.id,
       t.source,
       t.source_key,
-      t.source_page_id,
       t.source_url,
       t.title,
       t.content,
@@ -150,7 +135,6 @@ BEGIN
       t.id,
       t.source,
       t.source_key,
-      t.source_page_id,
       t.source_url,
       t.title,
       t.content,
@@ -168,9 +152,6 @@ $$;
 REVOKE ALL ON FUNCTION public.lexical_search_thoughts(text, int, boolean) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.lexical_search_thoughts(text, int, boolean) TO service_role;
 
--- ---------------------------------------------------------------------------
--- Aggregated stats for MCP thought_stats tool (single round-trip)
--- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.cerebro_thought_stats()
 RETURNS jsonb
 LANGUAGE sql
@@ -195,8 +176,6 @@ AS $$
       ),
       '{}'::jsonb
     ),
-    'with_title', (SELECT COUNT(*)::int FROM public.thoughts WHERE title IS NOT NULL AND btrim(title) <> ''),
-    'without_title', (SELECT COUNT(*)::int FROM public.thoughts WHERE title IS NULL OR btrim(title) = ''),
     'awaiting_enrichment', (SELECT COUNT(*)::int FROM public.thoughts WHERE enriched_at IS NULL)
   );
 $$;

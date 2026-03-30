@@ -93,6 +93,7 @@ Deno.serve(async (req) => {
   const teamId = typeof body.team_id === "string" ? body.team_id : null;
   const event = body.event as Record<string, unknown> | undefined;
   const captureChannel = requireEnv("SLACK_CAPTURE_CHANNEL_ID").trim();
+  const channelLabel = Deno.env.get("SLACK_CAPTURE_CHANNEL_NAME")?.trim();
 
   if (!eventId || !event) {
     return new Response(JSON.stringify({ ok: true, ignored: true }), {
@@ -158,7 +159,6 @@ Deno.serve(async (req) => {
   const row = {
     source: "slack",
     source_key: `slack:event:${eventId}`,
-    source_page_id: null as string | null,
     source_url: null as string | null,
     title: null as string | null,
     content: text,
@@ -184,6 +184,10 @@ Deno.serve(async (req) => {
       status: 500,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  if (channelLabel) {
+    console.log(`cerebro-ingest-slack: captured message in ${channelLabel} (${channel})`);
   }
 
   return new Response(JSON.stringify({ ok: true }), {
